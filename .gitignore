@@ -1,0 +1,7 @@
+# 本插件的 lib/index.js 是**手写源码**（没有编译步骤），必须入库。
+# 因此这里刻意不忽略 lib/。
+node_modules/
+*.tgz
+*.log
+.DS_Store
+Thumbs.db
