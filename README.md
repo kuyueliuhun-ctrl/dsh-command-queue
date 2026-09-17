@@ -96,6 +96,13 @@ or the agent is not idle.
 
 仓库：<https://github.com/kuyueliuhun-ctrl/dsh-command-queue>
 
+> **本包是 host + client 双面插件。** host 半边做排队与执行，client 半边
+> （`exports["./client"]`，由 `package.json` 的 `dsh.client.platform: "web"` 声明）
+> 在浏览器里渲染队列面板。
+> ⚠️ 客户端插件是**页面加载时**装配的，所以安装后需要**刷新页面**才会出现面板；
+> 运行时注入（方式 C）也需要刷新。
+
+
 ### 方式 A：从 GitHub 装配进 profile（推荐，重启后仍在）
 
 ```bash
@@ -149,7 +156,8 @@ dev_uninject_plugin { "match": "dsh-command-queue" }
   name: 'dsh-command-queue'
   config:
     verbose: true                    # 打开排队/执行日志（默认 false）
-    pollIntervalMs: 250              # 轮询兜底间隔，50–5000（默认 250）
+    pollIntervalMs: 250              # host 侧等空闲的轮询兜底间隔，50–5000（默认 250）
+    exposeState: true                # 注册给浏览器面板的已鉴权路由（默认 true；false = 纯 host）
     immediateCommands:               # 整体替换默认白名单
       - stop
       - cancel
@@ -162,7 +170,8 @@ dev_uninject_plugin { "match": "dsh-command-queue" }
 
 ## 6. `/cmdqueue`
 
-插件注册了一个只读命令，用来查看当前 agent 还排着哪些命令：
+插件注册了一个只读命令，用纯文本查看当前 agent 还排着哪些命令
+（浏览器面板见 §8；两者读的是同一份队列）：
 
 ```
 /cmdqueue
@@ -188,7 +197,47 @@ FIFO 串行、多 agent 隔离、取消、卸载不丢命令、轮询兜底、�
 
 ---
 
-## 8. 你会看到什么（实测的运行时行为）
+## 8. 浏览器队列面板（client 半边）
+
+**它挂在哪**：DSH 原生消息队列本身就是槽位 `conversation.input.dock` 上的一个
+**list 贡献**（`dsh-client-ui-conversation/lib/client.js:14543` 的 `queueDockEntry`，
+`id: "queue"`、`order: 20`）。list 槽允许第三方携带自己的 `id` **追加**条目，
+所以本插件注册 `id: "command-queue"`、`order: 30`，两条队列上下并排：
+
+```js
+ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({
+  name: 'conversation.input.dock',
+  id: 'command-queue',
+  order: 30,
+  inject: (sessionId) => ({ sessionId }),   // 返回值就是组件 props
+}, CommandQueueDock))
+```
+
+**样式来源**：CSS 直接取自原生 QueueDock 的 CSS 模块原文
+（`dsh-client-ui-conversation/lib/client.js:14142` 的 `css$6`），类名统一改前缀为
+`dshcq_` 避免冲突，设计变量（`--dsw-alias-*`、`--dsh-composer-*`）沿用全局主题，
+因此深浅色主题下与原生队列表现一致。样式通过官方那套
+`<style data-plugin-css=…>` 注入模式幂等插入。
+
+**数据从哪来**：`ctx.connection.fetch.register()` 注册两条**已鉴权**路由：
+
+| 路由 | 方法 | 用途 |
+|---|---|---|
+| `/api/command-queue/state` | GET / HEAD | 按 `?sessionId=` 返回队列快照 `{ok, items:[{id,name,line,queuedAt}]}` |
+| `/api/command-queue/drop` | POST | `{sessionId, id}` 移除一条在队命令（命令不会被执行） |
+
+它们由 `/api` 前缀处理器分发，因此**先过** `requestRejection()`
+（Host/Origin 信任围栏 + 浏览器签名 cookie）。
+刻意**不用**裸 `ctx.webServer.register()` —— 那条路径完全绕过鉴权，
+且把 exact 路由注册在 `/api/*` 下还会遮蔽内建鉴权。
+
+**容错**：`apply` 整体 try/catch，组件内所有网络/DOM 操作自吞异常，空队列渲染
+`null`，`useId` 缺失时降级为常量。这些不是洁癖——客户端 bundle 抛错会让整个
+Web 应用无法 mount。
+
+---
+
+## 9. 你会看到什么（实测的运行时行为）
 
 这些结论来自对运行中 `@deepseek-ai/dsh@0.1.6-alpha.1` 客户端/host 代码的逐行核对。
 
@@ -197,15 +246,19 @@ FIFO 串行、多 agent 隔离、取消、卸载不丢命令、轮询兜底、�
 1. 命令**被挂起排队**，输入框**不会冻结**——因为 `/compact` 没有 `input` 描述符，
    客户端走 `runDetached`（fire-and-forget）路径，本来就不等 RPC 返回。
    你可以继续打字、继续排消息。
-2. **这段时间没有任何「已排队」提示**。原因是 UI 的「执行中…」扫光卡片由会话事件
-   `command/run` 驱动，而该事件由 `CommandRuntime.execute` 在**调用 handler 之前**
-   写入——我们在它之前就挂住了，所以此刻没有任何持久卡片可渲染。
-   （客户端里确实定义了脉冲指示器 `.pending` 与 `data-phase=submitting` 样式，
-   但编译产物中没有任何地方引用它们，属于死 CSS，不会出现。）
+2. **composer 上方立刻出现「命令队列」面板**（v0.2.0 起），样式复刻原生消息队列：
+   单条直接列出一行 `/compact`，多条折叠成「已排队命令 · N」可展开列表，
+   每行右侧有一个移除按钮。它挂在原生队列**同一个槽位** `conversation.input.dock`
+   上（原生 id `queue` / order 20，本插件 id `command-queue` / order 30），
+   所以两条队列是上下并排的。
 3. **回合结束后**，命令真正执行，此时 `command/run` + `command/done` 落盘并流回
    浏览器，transcript 里出现正常的命令卡片：先「执行中…」，再「已完成」+
    真实结果文案（例如 `Compacted 12 history items (~3456 tokens).`），失败则红色「指令失败」。
-4. 想随时查看队列，敲 **`/cmdqueue`**。
+   队列面板里对应的那行同时消失。
+4. 不想开浏览器面板时：`/cmdqueue` 用纯文本报告同一份队列。
+
+> 注：面板每 1.5s 轮询一次 host 快照，**只在有排队命令时才渲染**（空队列返回 `null`，
+> 零视觉占用）。轮询走的是已鉴权路由，刷新页面后自动恢复。
 
 **取消语义（重要）**：
 
@@ -231,10 +284,17 @@ FIFO 串行、多 agent 隔离、取消、卸载不丢命令、轮询兜底、�
 
 ---
 
-## 9. 验证记录
+## 10. 验证记录
 
-**单元测试**：`node --test tests/*.test.mjs` → 17/17 通过（含 traceable Proxy 的
-patch/还原两个回归用例）。
+**单元测试**：`npm test` → **29/29 通过**，含两个专门针对踩过的坑的回归用例
+（traceable Proxy 的 patch 与精确还原）。
+
+**浏览器半边冒烟测试**（`tests/client-bundle.test.mjs`，7 项）：用最小 React 运行时 +
+假 `window.__ModuleLoader__` 把 `lib/client.js` 真正加载并渲染，断言 bundle 形态
+（id/factory/无 default）、dock 条目 id 与 order、异常自吞、空队列渲染 `null`、
+有队列时渲染出命令行并能经 drop 路由移除。
+> 这道测试是必需的而非可选的：DSH 的 boot 审计**没有 per-plugin 隔离**，
+> 客户端 bundle 抛错会让整个 Web 应用无法 mount。
 
 **真实端到端**（插件注入运行中的 host 后，经 typert gateway 用 HTTP 直连验证）：
 
@@ -253,7 +313,7 @@ T1 与 T2 的对比同时证明了：补丁确实落在 gateway 的调用路径�
 
 ---
 
-## 10. 出处
+## 11. 出处
 
 实现依据（运行中的 `@deepseek-ai/dsh@0.1.6-alpha.1`，路径为
 `/root/deepseek-harness-016/node_modules/@deepseek-ai/`）：

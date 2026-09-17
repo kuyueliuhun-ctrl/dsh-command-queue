@@ -1,5 +1,87 @@
 # Changelog
 
+## v0.2.0 — 2026-09-18
+
+**新增浏览器队列面板：排队中的斜杠命令现在看得见了。**
+
+### 背景
+
+v0.1.0 的排队是 host 侧的延迟执行，功能正确但**排队期间没有任何可见提示** ——
+UI 的「执行中…」卡片由会话事件 `command/run` 驱动，而它在 handler 调用前才写入，
+我们正是卡在它之前。
+
+排查后确认**不能用 DSH 原生队列**达成这件事，这是结构性的：
+
+1. 原生队列（agent inbox）的条目只能是 `UserMessage`（模型可见内容），
+   没有「命令项」这个类型；
+2. 队列项在**下一个 step 边界**就被 `claim()` 取走，那一刻 agent 仍在
+   running，`compactNow` 照样报 busy —— 只是把错误推迟几十秒；
+3. 若用官方 `agent/pre-step` waterfall 把标记从 `messages` 里摘掉（让模型看不见），
+   它此时已经出队，原生队列 UI 上随之消失。
+
+即「一直待在原生队列里显示」与「等到 idle 才执行」在 `/compact` 上互斥。
+这正是 DSH 作者写下 *"Queue the command itself. Rejected."* 的原因。
+
+### 做法：自建队列 + 复刻原生队列样式
+
+原生消息队列本身就是槽位 `conversation.input.dock` 上的一个 **list 贡献**
+（`id: "queue"`、`order: 20`）。list 槽允许第三方携带自己的 `id` 追加条目，
+于是本插件注册 `id: "command-queue"`、`order: 30`，在原生队列正下方并排渲染
+自己的命令队列：
+
+- **样式**：CSS 取自原生 QueueDock 的 CSS 模块原文
+  （`dsh-client-ui-conversation/lib/client.js:14142`），类名前缀改为 `dshcq_`，
+  设计变量沿用全局主题，深浅色下与原生队列一致；DOM 结构同样复刻
+  （`dock > panel > header(可折叠计数) / ul.list > li.row`，每行一个移除按钮）。
+- **数据通道**：`ctx.connection.fetch.register()` 注册两条**已鉴权**路由
+  `/api/command-queue/state`（GET 快照）与 `/api/command-queue/drop`（POST 移除）。
+  它们由 `/api` 前缀处理器分发，因此先过 `requestRejection()` 的 Host/Origin
+  围栏与浏览器签名 cookie 校验。刻意**不用**裸 `ctx.webServer.register()`：
+  那条路径完全绕过鉴权，把 exact 路由注册在 `/api/*` 下还会遮蔽内建鉴权。
+- client 每 1.5s 轮询一次；**空队列渲染 `null`**，零视觉占用。
+
+### ⚠️ 从 v0.1.0 升级的注意点
+
+`dsh-client-modules` 的 `resolveMeta()` 有一层 **`pkgMeta` 负缓存**
+（`dsh-client-modules/lib/index.js:652`）：包在**没有** `dsh.client` 声明的形态下
+被加载过一次，`null` 就会被缓存，之后即使补上 `dsh.client` 也读不到，
+client 半边不会注册。
+
+- **重启 host** 即可（缓存冷启动，最省事）；
+- 不想重启时，清掉该进程里的 `clientModules.pkgMeta` 里对应条目再调
+  `processOne(包名)` + `compose()` + `notifyGraphChanged()` 即可（本次升级就是这样处理的）。
+- 全新安装不受影响。
+
+另外别忘了：客户端插件是**页面加载时**装配的，升级后需要**刷新页面**。
+
+### 其它变更
+
+- 队列条目改为带 id（`cq1`、`cq2`…），支持从面板/接口移除一条在队命令
+  （被移除的命令**不会执行**，RPC 返回 `removed from the command queue`）。
+- 新增配置 `exposeState`（默认 `true`）；设为 `false` 即回到纯 host 形态。
+- `/cmdqueue` 与浏览器面板读同一份队列。
+
+### 兼容性与风险控制
+
+- host 侧仅用到公开面：`ctx.commands.execute/find/register`、`agent.status`、
+  `agent.ctx.on('agent/status')`、`ctx.connection.fetch.register`。
+- 客户端 bundle 抛错会让**整个 Web 应用无法 mount**（DSH 的 boot 审计没有
+  per-plugin 隔离），因此：`apply` 整体 try/catch、组件内网络/DOM 操作全自吞、
+  空队列返回 `null`、`React.useId` 缺失时降级为常量。
+- 新增 `tests/client-bundle.test.mjs`：用最小 React 运行时 + 假
+  `window.__ModuleLoader__` 把 bundle 真正加载并渲染，覆盖 bundle 形态
+  （id/factory/无 default）、dock 条目 id 与 order、异常自吞、空队列渲染 `null`、
+  有队列时渲染命令行并经 drop 路由移除。
+- 客户端插件是**页面加载时**装配的 —— 安装/注入后需要**刷新页面**才会出现面板。
+
+### 验证
+
+- 单元测试：`npm test` → **29/29 通过**（host 22 + client 7）。
+- 真实端到端（v0.1.0 已验，逻辑未变）：非命令行 2ms 返回 200；
+  已注册命令在 agent running 时被挂起排队（8s 无响应）。
+
+---
+
 ## v0.1.0 — 2026-09-18
 
 首个版本：让 `/compact` 这类**斜杠命令**在 agent 忙碌时不再立刻报错，

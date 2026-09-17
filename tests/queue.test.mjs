@@ -43,8 +43,20 @@ function createHarness(options = {}) {
   }
 
   const disposers = []
+  // 假的 connection.fetch 路由表：记录注册的 path → handler，便于直接调用验证。
+  const fetchRoutes = new Map()
+  const connection = {
+    fetch: {
+      register(route) {
+        if (fetchRoutes.has(route.path)) throw new Error(`duplicate route ${route.path}`)
+        fetchRoutes.set(route.path, route)
+        return () => fetchRoutes.delete(route.path)
+      },
+    },
+  }
   const ctx = {
     commands,
+    connection,
     logger: {
       info: (message) => logs.push(message),
       warn: (message) => logs.push(`WARN ${message}`),
@@ -53,11 +65,17 @@ function createHarness(options = {}) {
       disposers.push(body())
       return () => {}
     },
+    inject(_deps, callback) {
+      callback(ctx)
+      return () => {}
+    },
   }
 
   return {
     ctx,
     commands,
+    connection,
+    fetchRoutes,
     calls,
     logs,
     definitions,
@@ -391,4 +409,120 @@ test('traceable Proxy：已有他人 patch 时按原描述符还原，不破坏�
 
   harness.disposeAll()
   assert.equal(raw.execute, upstream, '卸载后应还原成上游那层包装')
+})
+
+test('state 路由：按会话返回排队命令快照', async () => {
+  const harness = createHarness()
+  apply(harness.ctx, {})
+  const agent = createAgent('s1', 'running')
+
+  const route = harness.fetchRoutes.get('/api/command-queue/state')
+  assert.ok(route, 'state 路由应已注册')
+  assert.deepEqual(route.methods, ['GET', 'HEAD'])
+  assert.equal(route.path, '/api/command-queue/state')
+
+  // 空队列
+  const empty = await route.fetch(new Request('http://x/api/command-queue/state?sessionId=s1'))
+  assert.deepEqual(await empty.json(), { ok: true, items: [] })
+
+  // 未知会话
+  const unknown = await route.fetch(new Request('http://x/api/command-queue/state?sessionId=nope'))
+  assert.deepEqual(await unknown.json(), { ok: true, items: [] })
+
+  const pending = harness.commands.execute(agent, '/compact', [], new AbortController().signal)
+  await flush()
+
+  const snapshot = await (await route.fetch(new Request('http://x/api/command-queue/state?sessionId=s1'))).json()
+  assert.equal(snapshot.items.length, 1)
+  assert.equal(snapshot.items[0].name, 'compact')
+  assert.equal(snapshot.items[0].line, '/compact')
+  assert.match(snapshot.items[0].id, /^cq\d+$/)
+  assert.equal(typeof snapshot.items[0].queuedAt, 'number')
+
+  // HEAD 不应带 body
+  const head = await route.fetch(new Request('http://x/api/command-queue/state?sessionId=s1', { method: 'HEAD' }))
+  assert.equal(head.status, 200)
+  assert.equal(await head.text(), '')
+
+  agent.goIdle()
+  await pending
+  const after = await (await route.fetch(new Request('http://x/api/command-queue/state?sessionId=s1'))).json()
+  assert.deepEqual(after.items, [])
+})
+
+test('drop 路由：移除在队命令后它不会被执行', async () => {
+  const harness = createHarness()
+  apply(harness.ctx, {})
+  const agent = createAgent('s1', 'running')
+
+  const pending = harness.commands.execute(agent, '/compact', [], new AbortController().signal)
+  await flush()
+
+  const stateRoute = harness.fetchRoutes.get('/api/command-queue/state')
+  const snapshot = await (await stateRoute.fetch(new Request('http://x/api/command-queue/state?sessionId=s1'))).json()
+  const id = snapshot.items[0].id
+
+  const dropRoute = harness.fetchRoutes.get('/api/command-queue/drop')
+  assert.ok(dropRoute, 'drop 路由应已注册')
+  const dropResponse = await dropRoute.fetch(
+    new Request('http://x/api/command-queue/drop', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: 's1', id }),
+    }),
+  )
+  assert.equal(dropResponse.status, 200)
+  assert.deepEqual(await dropResponse.json(), { ok: true, dropped: true })
+
+  const outcome = await pending
+  assert.equal(outcome.kind, 'error')
+  assert.match(outcome.text, /removed from the command queue/)
+  assert.equal(harness.calls.length, 0, '被移除的命令不应执行')
+
+  // 即使 agent 随后空闲，也不会再执行
+  agent.goIdle()
+  await flush()
+  assert.equal(harness.calls.length, 0)
+
+  const after = await (await stateRoute.fetch(new Request('http://x/api/command-queue/state?sessionId=s1'))).json()
+  assert.deepEqual(after.items, [])
+})
+
+test('drop 路由：未知会话/未知 id 不报错，只回 dropped:false', async () => {
+  const harness = createHarness()
+  apply(harness.ctx, {})
+  const dropRoute = harness.fetchRoutes.get('/api/command-queue/drop')
+
+  const missing = await dropRoute.fetch(
+    new Request('http://x/api/command-queue/drop', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: 'nope', id: 'cq99' }),
+    }),
+  )
+  assert.deepEqual(await missing.json(), { ok: true, dropped: false })
+
+  const badBody = await dropRoute.fetch(
+    new Request('http://x/api/command-queue/drop', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: 'not json',
+    }),
+  )
+  assert.equal(badBody.status, 400)
+  assert.equal((await badBody.json()).ok, false)
+})
+
+test('exposeState:false 时不注册任何 client 路由', () => {
+  const harness = createHarness()
+  apply(harness.ctx, { exposeState: false })
+  assert.equal(harness.fetchRoutes.size, 0)
+})
+
+test('卸载会摘掉 client 路由', () => {
+  const harness = createHarness()
+  apply(harness.ctx, {})
+  assert.equal(harness.fetchRoutes.size, 2)
+  harness.disposeAll()
+  assert.equal(harness.fetchRoutes.size, 0)
 })
